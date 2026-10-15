@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared MXFP4/MXFP8 MoE and heterogeneous MoE kernel builders."""
+"""Shared MXFP4/MXFP8 MoE and heterogeneous MoE kernel builders.
 
-"""MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
+MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
 
 This module contains the **kernel builder code** for:
 - `moe_gemm1` (stage1, with silu/swiglu activation)
@@ -27,7 +27,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import CmpIPredicate
+from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -40,6 +40,7 @@ from aiter.ops.flydsl.kernels.act import (
 )
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtypeInt
 
 from .layout_utils import crd2idx, idx2crd
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
@@ -54,6 +55,7 @@ from .mfma_preshuffle_pipeline import (
     swizzle_xor16,
     tile_chunk_coord_i32,
 )
+from .quant_utils import emit_mx_e8m0_scale
 from .tensor_shim import ptr_rsrc
 
 _VALID_A_DTYPES = frozenset(("fp8", "fp16", "bf16", "int8", "fp4"))
@@ -2245,8 +2247,6 @@ def compile_mixed_moe_gemm1_common(
                 c64_i32 = arith.constant(64, type=T.i32)
                 c254_i32 = arith.constant(254, type=T.i32)
                 c256_i32 = arith.constant(256, type=T.i32)
-                c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
-                c0x400000_i32 = arith.constant(0x400000, type=T.i32)
                 c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
                 c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)
@@ -2256,8 +2256,14 @@ def compile_mixed_moe_gemm1_common(
                 c0x7_i32 = arith.constant(0x7, type=T.i32)
                 c0_f32 = arith.constant(0.0, type=T.f32)
 
-                fp_headroom = 2 if need_fp4 else (8 if need_fp8 else 0)
-                c_headroom_i32 = arith.constant(fp_headroom, type=T.i32)
+                # FP8 follows the HW variant: gfx942 e4m3fnuz (max 240), gfx950
+                # e4m3fn (max 448)
+                if need_fp4:
+                    mx_dtype = MxDtypeInt.FP4_E2M1
+                elif gpu_arch == "gfx942":
+                    mx_dtype = MxDtypeInt.FP8_E4M3_FNUZ
+                else:
+                    mx_dtype = MxDtypeInt.FP8_E4M3
 
                 def f32_to_e2m1(qx_f32):
                     """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
@@ -2309,10 +2315,13 @@ def compile_mixed_moe_gemm1_common(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(T.i32)
-                        max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
+                        e8m0_biased = ArithValue(
+                            emit_mx_e8m0_scale(
+                                local_max,
+                                mode=MX_DEFAULT_ROUND_MODE,
+                                dtype=mx_dtype,
+                            )
+                        )
 
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(T.f32)

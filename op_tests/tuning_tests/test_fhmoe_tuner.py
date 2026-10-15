@@ -8,12 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.utility import fp4_utils
 from op_tests.tuners import tune_fhmoe
 from op_tests.tuners.tune_fhmoe import (
     PROFILE_FIELDS,
     Contract,
-    _fp8_group_quant_dequant,
     _matches,
     _parse_nonnegative_float,
     _parse_positive_float,
@@ -122,27 +120,6 @@ def test_zero_swiglu_limit_keeps_routed_reference_unclamped():
     up = torch.tensor([[3.0, -3.0]])
     expected = torch.nn.functional.silu(gate) * up
     assert torch.equal(_routed_silu(gate, up, 0), expected)
-
-
-def test_sampled_reference_uses_fused_moe_mxfp8_rounding():
-    amax = torch.tensor([383.0, 384.0, 400.0, 448.0])
-    scales = fp4_utils.f32_to_fused_moe_mxfp8_scale(amax).view(torch.uint8)
-    assert scales.tolist() == [0x7F, 0x80, 0x80, 0x80]
-
-
-def test_input_and_fused_intermediate_use_distinct_mxfp8_rounding(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(tune_fhmoe.dtypes, "fp8", torch.float8_e4m3fnuz)
-    values = torch.zeros(32)
-    values[0] = 1.5
-    values[1] = 2**-17
-
-    input_qdq = _fp8_group_quant_dequant(values)
-    fused_qdq = _fp8_group_quant_dequant(values, fused_intermediate=True)
-
-    assert input_qdq[1] != 0
-    assert fused_qdq[1] == 0
 
 
 def test_hy4_rows_and_candidate_kernels_are_complete():

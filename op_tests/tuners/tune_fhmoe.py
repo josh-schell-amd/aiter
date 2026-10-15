@@ -806,17 +806,11 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     )
 
 
-def _fp8_group_quant_dequant(
-    x: torch.Tensor, *, fused_intermediate: bool = False
-) -> torch.Tensor:
+def _fp8_group_quant_dequant(x: torch.Tensor) -> torch.Tensor:
     shape = x.shape
     blocks = x.float().view(-1, 32)
     amax = blocks.abs().amax(dim=1)
-    scale = (
-        fp4_utils.f32_to_fused_moe_mxfp8_scale(amax)
-        if fused_intermediate
-        else fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3)
-    )
+    scale = fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3)
     scale_f32 = fp4_utils.e8m0_to_f32(scale).view(-1, 1)
     quant = (blocks / scale_f32).to(torch.float8_e4m3fn)
     return (quant.float() * scale_f32).view(shape)
@@ -874,7 +868,7 @@ def _sampled_fp32_reference(
         )
         gate, up = F.linear(expanded_hidden[mask], w1).chunk(2, dim=-1)
         intermediate = _routed_silu(gate, up, swiglu_limit)
-        intermediate = _fp8_group_quant_dequant(intermediate, fused_intermediate=True)
+        intermediate = _fp8_group_quant_dequant(intermediate)
         w2 = _dequant_fp8_weight(
             tensors.sample_w2[storage], tensors.sample_w2_scale[storage]
         )
@@ -888,8 +882,7 @@ def _sampled_fp32_reference(
     shared_gate, shared_up = shared_gate_up.chunk(2, dim=-1)
     shared_intermediate = F.silu(shared_gate) * shared_up
     shared_intermediate = _fp8_group_quant_dequant(
-        shared_intermediate.to(torch.bfloat16).float(),
-        fused_intermediate=True,
+        shared_intermediate.to(torch.bfloat16).float()
     )
     shared_w2 = _dequant_fp8_weight(
         tensors.sample_shared_w2[0], tensors.sample_shared_w2_scale[0]

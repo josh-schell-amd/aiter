@@ -8,7 +8,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtypeInt
+
 from ..act import situ_mul, tanh_via_sigmoid_f32
+from ..quant_utils import emit_mx_e8m0_scale
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
@@ -656,11 +659,9 @@ def _group_absmax(vals, shuffle_offs, c64):
     return m
 
 
-def _e8m0_scale(amax):
-    """E8M0 exponent of a 1x32 group's |max| and the matching FP8 quant multiplier."""
-    max_rounded = (amax.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-    e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
-    e8m0 = (e > fx.Int32(0)).select(e, fx.Int32(0))
+def _e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3):
+    """E8M0 exponent of a 1x32 group's |max| and the matching quant multiplier."""
+    e8m0 = fx.Int32(emit_mx_e8m0_scale(amax, mode=MX_DEFAULT_ROUND_MODE, dtype=dtype))
     quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, quant_scale
 
@@ -864,10 +865,9 @@ class SiluQuantEpilogue:
                 m = a0.maximumf(a1)
                 for off in (1, 2, 4, 8):
                     m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
-                max_rounded = (m.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-                _e = (max_rounded >> fx.Int32(23)) - fx.Int32(2 if self._is_fp4 else 8)
-                e8m0_v = (_e > fx.Int32(0)).select(_e, fx.Int32(0))
-                quant_scale = ((fx.Int32(254) - e8m0_v) << fx.Int32(23)).bitcast(fx.Float32)
+                e8m0_v, quant_scale = _e8m0_scale(
+                    m, MxDtypeInt.FP4_E2M1 if self._is_fp4 else MxDtypeInt.FP8_E4M3
+                )
                 gcol = out_tile_base + col0
 
                 if const_expr(self._is_fp4):

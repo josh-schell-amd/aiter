@@ -614,17 +614,11 @@ def _run_composed_oracle(
     )
 
 
-def _fp8_group_quant_dequant(
-    x: torch.Tensor, group_size: int, *, fused_intermediate: bool = False
-) -> torch.Tensor:
+def _fp8_group_quant_dequant(x: torch.Tensor, group_size: int) -> torch.Tensor:
     shape = x.shape
     blocks = x.float().view(-1, group_size)
     amax = blocks.abs().amax(dim=1)
-    scale = (
-        fp4_utils.f32_to_fused_moe_mxfp8_scale(amax)
-        if fused_intermediate
-        else fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3)
-    )
+    scale = fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3)
     scale_f32 = fp4_utils.e8m0_to_f32(scale).view(-1, 1)
     quant = (blocks / scale_f32).to(torch.float8_e4m3fn)
     return (quant.float() * scale_f32).view(shape)
@@ -636,13 +630,11 @@ def _fp4_group_quant_dequant(x: torch.Tensor) -> torch.Tensor:
     return fp4_utils.mxfp4_to_f32(quant) * scale_f32
 
 
-def _activation_quant_dequant(
-    x: torch.Tensor, quantization: str, *, fused_intermediate: bool = False
-) -> torch.Tensor:
+def _activation_quant_dequant(x: torch.Tensor, quantization: str) -> torch.Tensor:
     if quantization == "fp4":
         return _fp4_group_quant_dequant(x)
     if quantization == "fp8":
-        return _fp8_group_quant_dequant(x, 32, fused_intermediate=fused_intermediate)
+        return _fp8_group_quant_dequant(x, 32)
     raise ValueError(f"Unsupported activation quantization: {quantization}")
 
 
@@ -693,11 +685,7 @@ def _torch_routed_reference(
         gate = gate.clamp(max=activation_limit)
         up = up.clamp(min=-activation_limit, max=activation_limit)
         inter = F.silu(gate) * up
-        inter = _activation_quant_dequant(
-            inter,
-            activation_quantization,
-            fused_intermediate=activation_quantization == "fp8",
-        )
+        inter = _activation_quant_dequant(inter, activation_quantization)
         slot_out[mask] = F.linear(inter, w2[weight_index])
 
     return (slot_out * routed_weight[..., None]).sum(dim=1)
@@ -728,7 +716,7 @@ def _torch_shared_reference(
         inter = _fp4_group_quant_dequant(inter)
     elif group_size is not None:
         inter = inter.to(dtypes.bf16).float()
-        inter = _fp8_group_quant_dequant(inter, group_size, fused_intermediate=True)
+        inter = _fp8_group_quant_dequant(inter, group_size)
     return F.linear(inter, w2[0])
 
 
