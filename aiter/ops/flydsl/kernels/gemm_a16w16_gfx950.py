@@ -26,6 +26,7 @@ from .gemm_a16w16_gfx950_utils import (
     make_transposed_lds_layout,
     swizzled_col_idx,
     transposed_contiguous_idx,
+    unsigned_ceil_div,
     wait_vmcnt_and_barrier,
 )
 from .kernels_common import run_cached
@@ -570,8 +571,8 @@ def gemm_a16w16_gfx950_kernel(
     threads_per_k_slice = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
     tid_in_k_slice = tid % threads_per_k_slice
     k_wave_idx = tid // threads_per_k_slice
-    num_pid_m = (m + block_m - 1) // block_m
-    num_pid_n = (n + block_n - 1) // block_n
+    num_pid_m = unsigned_ceil_div(m, block_m)
+    num_pid_n = unsigned_ceil_div(n, block_n)
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
@@ -580,7 +581,7 @@ def gemm_a16w16_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    k_tiles = ((ks_end - ks_begin).to(fx.Uint32) // block_k).to(fx.Int32)
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
     a_src, a_outer_begin = make_block_src(
@@ -943,8 +944,8 @@ def gemm_a16w16_hti_gfx950_kernel(
 
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
-    num_pid_m = (m + block_m - 1) // block_m
-    num_pid_n = (n + block_n - 1) // block_n
+    num_pid_m = unsigned_ceil_div(m, block_m)
+    num_pid_n = unsigned_ceil_div(n, block_n)
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
@@ -953,7 +954,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    k_tiles = ((ks_end - ks_begin).to(fx.Uint32) // block_k).to(fx.Int32)
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
     a_src, a_outer_begin = make_block_src(

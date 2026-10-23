@@ -23,6 +23,15 @@ GFX950_BUFFER_MAX_OFFSET = 2**31
 GFX950_BUFFER_REBASE_ELEMS = 2**30
 
 
+def unsigned_ceil_div(a, b):
+    """ceil(a / b) for non-negative a and positive constant b, as an Int32.
+
+    Python // on a signed value lowers to floor division, which adds a
+    negative-value correction the never-negative block math does not need.
+    """
+    return ((fx.Int32(a).to(fx.Uint32) + (b - 1)) // b).to(fx.Int32)
+
+
 def wait_vmcnt_and_barrier(vmcnt=0):
     rocdl.s_waitcnt(vmcnt=vmcnt)
     rocdl.s_barrier()
@@ -70,10 +79,16 @@ class BlockSwizzle:
 
     @flyc.jit
     def swizzle(self, num_pid_m, num_pid_n, pid):
+        # Block ids and counts are never negative, so unsigned division gives
+        # the same mapping without the sign and floor corrections signed // adds
+        # to every divide at workgroup start.
+        num_pid_m = fx.Int32(num_pid_m).to(fx.Uint32)
+        num_pid_n = fx.Int32(num_pid_n).to(fx.Uint32)
+        pid = fx.Int32(pid).to(fx.Uint32)
         simple_m = pid // num_pid_n
         simple_n = pid % num_pid_n
         if const_expr(self.GROUP_M <= 0):
-            return simple_m, simple_n
+            return simple_m.to(fx.Int32), simple_n.to(fx.Int32)
         num_xcds = self.NUM_XCDS
         swizzle_threshold = self.NUM_PIDS_THRESHOLD
         num_wg = num_pid_m * num_pid_n
@@ -92,8 +107,8 @@ class BlockSwizzle:
         swizzled_m = first_pid_m + (intra_group % group_size_m)
         use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
         return (
-            use_simple.select(simple_m, swizzled_m),
-            use_simple.select(simple_n, swizzled_n),
+            use_simple.select(simple_m, swizzled_m).to(fx.Int32),
+            use_simple.select(simple_n, swizzled_n).to(fx.Int32),
         )
 
 
