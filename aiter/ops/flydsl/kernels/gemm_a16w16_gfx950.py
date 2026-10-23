@@ -410,8 +410,10 @@ def async_load_to_lds(
     g2s_copy_layout = fx.make_layout(async_load_vec_size, 1)
     # src_base points at outer index src_outer_begin (make_block_src); K-major
     # blocks still need each K tile's offset, which is scaled by the stride.
+    # Row index and bound relative to the base, so the bound check and address
+    # share one vector value, exactly as with absolute rows.
     outer_begin = tile.global_outer_offset - tile.src_outer_begin
-    outer_left = tile.outer_bound - tile.global_outer_offset
+    outer_bound = tile.outer_bound - tile.src_outer_begin
     if const_expr(is_k_major):
         src_base = fx.rocdl.make_buffer_ptr(
             tile.src_base + fx.Int64(tile.k_tile * block_k) * tile.leading_stride
@@ -444,9 +446,8 @@ def async_load_to_lds(
                 )
             )
         # Rows past the bound read the base row, which is always valid.
-        block_outer_idx = (outer_local_idx < outer_left).select(
-            outer_begin + outer_local_idx, 0
-        )
+        outer_idx = outer_begin + outer_local_idx
+        block_outer_idx = (outer_idx < outer_bound).select(outer_idx, 0)
         if const_expr(is_k_major):
             local_offset = k_local_idx * tile.leading_stride + block_outer_idx
         else:
@@ -581,7 +582,7 @@ def gemm_a16w16_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = ((ks_end - ks_begin).to(fx.Uint32) // block_k).to(fx.Int32)
+    k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
     a_src, a_outer_begin = make_block_src(
@@ -954,7 +955,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = ((ks_end - ks_begin).to(fx.Uint32) // block_k).to(fx.Int32)
+    k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
     a_src, a_outer_begin = make_block_src(
