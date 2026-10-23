@@ -384,13 +384,12 @@ def make_block_src(tensor, block_outer_offset, ks_begin, leading_stride, is_k_ma
     if const_expr(is_k_major):
         offset = fx.Int64(ks_begin) * leading_stride + block_outer_offset
         return fx.get_iter(tensor) + offset, 0
-    # block_offset is never negative, so masks give base and remainder without
-    # the sign fix-up a signed % would emit on the path to the first load.
+    # block_offset is never negative, so the remainder is a mask of its low word
+    # and the base a subtract-with-borrow: no 64-bit mask constants or signed %.
     block_offset = fx.Int64(block_outer_offset) * leading_stride
-    rem = block_offset & (GFX950_BUFFER_REBASE_ELEMS - 1)
-    base = block_offset & ~(GFX950_BUFFER_REBASE_ELEMS - 1)
-    src = fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + base)
-    return src, rem.to(fx.Int32)
+    rem = block_offset.to(fx.Int32) & (GFX950_BUFFER_REBASE_ELEMS - 1)
+    src = fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + (block_offset - fx.Int64(rem)))
+    return src, rem
 
 
 def async_load_to_lds(
@@ -431,8 +430,10 @@ def async_load_to_lds(
         else:
             outer_local_idx = global_tid // ldg_x_threads
             k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+            # The block remainder rides on the scalar K start, so it adds no
+            # vector op to the load address.
             k_local_idx = (
-                context.ks_begin
+                (context.ks_begin + tile.src_rem)
                 + tile.k_tile * block_k
                 + swizzled_col_idx(
                     outer_local_idx,
@@ -449,9 +450,7 @@ def async_load_to_lds(
         if const_expr(is_k_major):
             local_offset = k_local_idx * tile.leading_stride + block_outer_idx
         else:
-            local_offset = (
-                tile.src_rem + block_outer_idx * tile.leading_stride + k_local_idx
-            )
+            local_offset = block_outer_idx * tile.leading_stride + k_local_idx
         src = fx.make_view(src_base + local_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
