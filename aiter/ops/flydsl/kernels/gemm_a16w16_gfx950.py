@@ -374,12 +374,14 @@ def make_block_src(tensor, block_outer_offset, ks_begin, leading_stride, is_k_ma
     64-bit math and per-load offsets only span one block, whatever the operand
     size. Built once at kernel entry, ahead of the scheduling barriers around the
     loads, so it overlaps with the rest of the prologue. Outer-major operands get
-    their buffer resource here; K-major ones are rebased per K tile at load time.
+    their buffer resource here and keep K offsets absolute (always < K, and the
+    same address math as before the rebase); K-major ones are rebased per K tile
+    at load time.
     """
     if const_expr(is_k_major):
         offset = fx.Int64(ks_begin) * leading_stride + block_outer_offset
         return fx.get_iter(tensor) + offset
-    offset = fx.Int64(block_outer_offset) * leading_stride + ks_begin
+    offset = fx.Int64(block_outer_offset) * leading_stride
     return fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + offset)
 
 
@@ -421,11 +423,15 @@ def async_load_to_lds(
         else:
             outer_local_idx = global_tid // ldg_x_threads
             k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-            k_local_idx = tile.k_tile * block_k + swizzled_col_idx(
-                outer_local_idx,
-                k_local_idx,
-                tile.lds_layout,
-                block_k,
+            k_local_idx = (
+                context.ks_begin
+                + tile.k_tile * block_k
+                + swizzled_col_idx(
+                    outer_local_idx,
+                    k_local_idx,
+                    tile.lds_layout,
+                    block_k,
+                )
             )
         global_outer_idx = tile.global_outer_offset + outer_local_idx
         # Rows past the bound read the block's first row, which is always valid.
