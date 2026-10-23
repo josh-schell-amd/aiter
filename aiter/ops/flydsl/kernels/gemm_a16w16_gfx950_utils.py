@@ -16,9 +16,8 @@ from .tensor_shim import buf_base_i64
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
-# Buffer-resource loads index elements with int32 offsets; keep every tensor
-# read through a buffer resource below 2^31 elements (4 GiB of 16-bit data).
-GFX950_BUFFER_MAX_ELEMENTS = 2**31
+# Buffer loads take an int32 element offset from the resource base.
+GFX950_BUFFER_MAX_OFFSET = 2**31
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
