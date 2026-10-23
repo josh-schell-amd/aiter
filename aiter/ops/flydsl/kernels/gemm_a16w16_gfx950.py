@@ -15,6 +15,7 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
     GFX950_BUFFER_MAX_OFFSET,
+    GFX950_BUFFER_REBASE_ELEMS,
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -82,6 +83,7 @@ class GemmABLoadContext:
 class AsyncLoadTile:
     lds_base: Any
     src_base: Any
+    src_rem: Any
     lds_layout: Any
     outer_tile_size: Any
     outer_bound: Any
@@ -368,21 +370,24 @@ def make_gemm_ab_load_context(
 
 
 def make_block_src(tensor, block_outer_offset, ks_begin, leading_stride, is_k_major):
-    """Base pointer of this workgroup's block of an A/B operand.
+    """(base, offset) of this workgroup's block of an A/B operand.
 
-    Buffer loads take int32 offsets, so the base moves to the block start with
-    64-bit math and per-load offsets only span one block, whatever the operand
-    size. Built once at kernel entry, ahead of the scheduling barriers around the
-    loads, so it overlaps with the rest of the prologue. Outer-major operands get
-    their buffer resource here and keep K offsets absolute (always < K, and the
-    same address math as before the rebase); K-major ones are rebased per K tile
-    at load time.
+    Buffer loads take int32 offsets, so the base is moved with 64-bit math and
+    the int32 offset only covers what is left. Outer-major operands move the base
+    in whole GFX950_BUFFER_REBASE_ELEMS steps and keep the remainder in the
+    offset: below that size the descriptor and offsets are exactly the
+    unrebased ones (a per-workgroup descriptor base measured ~2% slower at
+    360448x6144x1280 on MI355X with identical addresses). K-major operands
+    rebase per K tile at load time, since their K offset scales with the stride.
+    Built once at kernel entry, ahead of the scheduling barriers around the loads.
     """
     if const_expr(is_k_major):
         offset = fx.Int64(ks_begin) * leading_stride + block_outer_offset
-        return fx.get_iter(tensor) + offset
-    offset = fx.Int64(block_outer_offset) * leading_stride
-    return fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + offset)
+        return fx.get_iter(tensor) + offset, 0
+    block_offset = fx.Int64(block_outer_offset) * leading_stride
+    rem = block_offset % GFX950_BUFFER_REBASE_ELEMS
+    src = fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + (block_offset - rem))
+    return src, rem.to(fx.Int32)
 
 
 def async_load_to_lds(
@@ -400,8 +405,8 @@ def async_load_to_lds(
     elem_bytes = tile.src_base.dtype.width // 8
     lds_ptr = tile.lds_base + fx.Int32(context.wave_offset) // elem_bytes
     g2s_copy_layout = fx.make_layout(async_load_vec_size, 1)
-    # src_base starts at this workgroup's block (make_block_src); K-major blocks
-    # still need each K tile's offset, which is scaled by the leading stride.
+    # src_base/src_rem locate this workgroup's block (make_block_src); K-major
+    # blocks still need each K tile's offset, which is scaled by the stride.
     if const_expr(is_k_major):
         src_base = fx.rocdl.make_buffer_ptr(
             tile.src_base + fx.Int64(tile.k_tile * block_k) * tile.leading_stride
@@ -441,7 +446,9 @@ def async_load_to_lds(
         if const_expr(is_k_major):
             local_offset = k_local_idx * tile.leading_stride + block_outer_idx
         else:
-            local_offset = block_outer_idx * tile.leading_stride + k_local_idx
+            local_offset = (
+                tile.src_rem + block_outer_idx * tile.leading_stride + k_local_idx
+            )
         src = fx.make_view(src_base + local_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
@@ -575,10 +582,10 @@ def gemm_a16w16_gfx950_kernel(
     k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
-    a_src = make_block_src(
+    a_src, a_rem = make_block_src(
         a, block_m_offset, ks_begin, a_leading_stride, param.a_is_transposed
     )
-    b_src = make_block_src(
+    b_src, b_rem = make_block_src(
         b, block_n_offset, ks_begin, b_leading_stride, not param.b_is_transposed
     )
 
@@ -688,6 +695,7 @@ def gemm_a16w16_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=smem_a + stage * block_m * block_k,
                 src_base=a_src,
+                src_rem=a_rem,
                 lds_layout=a_lds_layout,
                 outer_tile_size=block_m,
                 outer_bound=m,
@@ -706,6 +714,7 @@ def gemm_a16w16_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=smem_b + stage * block_n * block_k,
                 src_base=b_src,
+                src_rem=b_rem,
                 lds_layout=b_lds_layout,
                 outer_tile_size=block_n,
                 outer_bound=n,
@@ -948,10 +957,10 @@ def gemm_a16w16_hti_gfx950_kernel(
     k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
-    a_src = make_block_src(
+    a_src, a_rem = make_block_src(
         a, block_m_offset, ks_begin, a_leading_stride, param.a_is_transposed
     )
-    b_src = make_block_src(
+    b_src, b_rem = make_block_src(
         b, block_n_offset, ks_begin, b_leading_stride, not param.b_is_transposed
     )
 
@@ -1028,6 +1037,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=half_a_base(stage, m_part),
                 src_base=a_src,
+                src_rem=a_rem,
                 lds_layout=a_lds_layout,
                 outer_tile_size=half_block_m,
                 outer_bound=m,
@@ -1046,6 +1056,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=half_b_base(stage, n_part),
                 src_base=b_src,
+                src_rem=b_rem,
                 lds_layout=b_lds_layout,
                 outer_tile_size=half_block_n,
                 outer_bound=n,
@@ -1422,12 +1433,20 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
-    # A and B loads rebase their buffer resource per tile (async_load_to_lds), so
-    # an int32 offset only spans tile rows x leading stride; this binds only for
+    # A and B loads rebase their buffer resource (make_block_src), so an int32
+    # offset spans one tile (tile rows x leading stride), plus a remainder below
+    # GFX950_BUFFER_REBASE_ELEMS for outer-major operands; this binds only for
     # rows of millions of elements. C is stored through int64 pointer offsets.
-    a_span = result.block_k * m if result.a_is_transposed else result.block_m * k
-    b_span = result.block_n * k if result.b_is_transposed else result.block_k * n
-    if max(a_span, b_span) >= GFX950_BUFFER_MAX_OFFSET:
+    outer_limit = GFX950_BUFFER_MAX_OFFSET - GFX950_BUFFER_REBASE_ELEMS
+    if result.a_is_transposed:
+        a_ok = result.block_k * m < GFX950_BUFFER_MAX_OFFSET
+    else:
+        a_ok = result.block_m * k < outer_limit
+    if result.b_is_transposed:
+        b_ok = result.block_n * k < outer_limit
+    else:
+        b_ok = result.block_k * n < GFX950_BUFFER_MAX_OFFSET
+    if not (a_ok and b_ok):
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n

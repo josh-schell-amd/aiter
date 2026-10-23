@@ -18,6 +18,9 @@ GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 # Buffer loads take an int32 element offset from the resource base.
 GFX950_BUFFER_MAX_OFFSET = 2**31
+# Outer-major A/B buffer bases move in steps of this many elements, so operands
+# below it keep the unrebased descriptor and offsets.
+GFX950_BUFFER_REBASE_ELEMS = 2**30
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
