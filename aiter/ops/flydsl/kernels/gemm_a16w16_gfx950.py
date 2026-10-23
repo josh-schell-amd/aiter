@@ -384,9 +384,12 @@ def make_block_src(tensor, block_outer_offset, ks_begin, leading_stride, is_k_ma
     if const_expr(is_k_major):
         offset = fx.Int64(ks_begin) * leading_stride + block_outer_offset
         return fx.get_iter(tensor) + offset, 0
+    # block_offset is never negative, so masks give base and remainder without
+    # the sign fix-up a signed % would emit on the path to the first load.
     block_offset = fx.Int64(block_outer_offset) * leading_stride
-    rem = block_offset % GFX950_BUFFER_REBASE_ELEMS
-    src = fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + (block_offset - rem))
+    rem = block_offset & (GFX950_BUFFER_REBASE_ELEMS - 1)
+    base = block_offset & ~(GFX950_BUFFER_REBASE_ELEMS - 1)
+    src = fx.rocdl.make_buffer_ptr(fx.get_iter(tensor) + base)
     return src, rem.to(fx.Int32)
 
 
