@@ -496,6 +496,7 @@ def gemm_a16w16_gfx950_kernel(
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
+    c_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
@@ -586,7 +587,7 @@ def gemm_a16w16_gfx950_kernel(
             block_n_offset,
             global_output_dtype,
             fx.block_idx.x,
-            n,
+            c_leading_stride,
         )
 
     ab_load_context = make_gemm_ab_load_context(
@@ -808,7 +809,7 @@ def gemm_a16w16_gfx950_kernel(
                         write_cshuffle_vec_to_global(
                             out,
                             out_buf,
-                            global_row * n + global_col,
+                            global_row * c_leading_stride + global_col,
                             c_val,
                             is_split_k,
                             param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
@@ -838,8 +839,8 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
-                # M * N can exceed 2^31.
-                global_offset = fx.Int64(global_row) * n + global_col
+                # M * ldc can exceed 2^31.
+                global_offset = fx.Int64(global_row) * c_leading_stride + global_col
                 write_cshuffle_vec_to_global(
                     out,
                     out_buf,
@@ -865,6 +866,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
+    c_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
@@ -953,7 +955,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             block_n_offset,
             global_output_dtype,
             fx.block_idx.x,
-            n,
+            c_leading_stride,
         )
 
     ab_load_context = make_gemm_ab_load_context(
@@ -1109,10 +1111,12 @@ def gemm_a16w16_hti_gfx950_kernel(
                         ),
                     )
                     if const_expr(is_split_k):
-                        global_offset = global_row * n + global_col
+                        global_offset = global_row * c_leading_stride + global_col
                     else:
-                        # M * N can exceed 2^31.
-                        global_offset = fx.Int64(global_row) * n + global_col
+                        # M * ldc can exceed 2^31.
+                        global_offset = (
+                            fx.Int64(global_row) * c_leading_stride + global_col
+                        )
                     write_cshuffle_vec_to_global(
                         out,
                         out_buf,
@@ -1303,6 +1307,7 @@ def gemm_a16w16_gfx950(
     b_leading_stride = fx.Int32(
         fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
     )
+    c_leading_stride = fx.Int32(fx.get_scalar(out.stride[0]))
     elem_dtype = (
         fx.Float16
         if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
@@ -1353,6 +1358,7 @@ def gemm_a16w16_gfx950(
         working_k,
         a_leading_stride,
         b_leading_stride,
+        c_leading_stride,
         tiled_mma,
         param,
     ).launch(
@@ -1482,6 +1488,7 @@ def gemm_a16w16(
     Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     ``out_dtype`` may be the input dtype or ``torch.float32``.
+    A 2D ``out`` may be row-strided; it is written in place and returned.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1562,10 +1569,9 @@ def gemm_a16w16(
     else:
         assert out.dtype == out_dtype
         assert out.device == device
-        assert out.is_contiguous()
-    out = out.view(-1, n)
-    assert out.shape[0] == m
-    assert out.dtype == out_dtype
+    if out.dim() != 2:
+        out = out.view(-1, n)
+    assert out.shape == (m, n)
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
@@ -1602,6 +1608,20 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
+    if out.stride(1) != 1 or (
+        m > 1
+        and (out.stride(0) < n or out.stride(0) % param.cshuffle_r2g_vec_size != 0)
+    ):
+        raise ValueError(
+            "out must be row-major with a leading stride of at least N and a "
+            f"multiple of {param.cshuffle_r2g_vec_size}; got shape="
+            f"{tuple(out.shape)} and stride={out.stride()}"
+        )
+    # Split-K's buffer atomics address C with i32 offsets.
+    if split_k > 1 and ((m - 1) * out.stride(0) + n) * out.element_size() >= (
+        GFX950_FLAT_BUFFER_LIMIT_BYTES
+    ):
+        raise ValueError("split-K output must span less than 4 GiB")
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
