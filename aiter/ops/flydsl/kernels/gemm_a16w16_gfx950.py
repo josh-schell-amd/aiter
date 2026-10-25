@@ -431,7 +431,7 @@ def async_load_to_lds(
 
 @flyc.jit
 def write_cshuffle_vec_to_global(
-    out,
+    c_ptr,
     out_buf,
     global_offset,
     c_vec,
@@ -461,7 +461,7 @@ def write_cshuffle_vec_to_global(
                 )
                 fx.copy_atom_call(atomic_atom, scalar_frag, scalar_dst)
         else:
-            fx.ptr_store(c_vec_global, fx.get_iter(out) + global_offset)
+            fx.ptr_store(c_vec_global, c_ptr + global_offset)
     elif const_expr(is_split_k):
         atomic_atom = fx.make_copy_atom(
             fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
@@ -483,7 +483,7 @@ def write_cshuffle_vec_to_global(
             )
             fx.copy_atom_call(atomic_atom, pair_frag, pair_dst)
     else:
-        fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
+        fx.ptr_store(c_vec, c_ptr + global_offset)
 
 
 @flyc.kernel
@@ -556,6 +556,11 @@ def gemm_a16w16_gfx950_kernel(
     c_stride = n
     if const_expr(not param.c_is_contiguous):
         c_stride = fx.Int32(fx.get_scalar(out.stride[0]))
+    if const_expr(not is_split_k):
+        # M * N can exceed 2^31: a 64-bit tile base, i32 offsets within the tile.
+        c_tile = fx.get_iter(out) + (
+            fx.Int64(block_m_offset) * c_stride + block_n_offset
+        )
 
     @fx.struct
     class SharedABStorage:
@@ -814,7 +819,7 @@ def gemm_a16w16_gfx950_kernel(
                                 ),
                             )
                         write_cshuffle_vec_to_global(
-                            out,
+                            fx.get_iter(out),
                             out_buf,
                             global_row * c_stride + global_col,
                             c_val,
@@ -846,12 +851,10 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
-                # M * N can exceed 2^31.
-                global_offset = fx.Int64(global_row) * c_stride + global_col
                 write_cshuffle_vec_to_global(
-                    out,
+                    c_tile,
                     out_buf,
-                    global_offset,
+                    local_row * c_stride + local_col,
                     c_vec,
                     is_split_k,
                     param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
@@ -926,6 +929,11 @@ def gemm_a16w16_hti_gfx950_kernel(
     c_stride = n
     if const_expr(not param.c_is_contiguous):
         c_stride = fx.Int32(fx.get_scalar(out.stride[0]))
+    if const_expr(not is_split_k):
+        # M * N can exceed 2^31: a 64-bit tile base, i32 offsets within the tile.
+        c_tile = fx.get_iter(out) + (
+            fx.Int64(block_m_offset) * c_stride + block_n_offset
+        )
 
     @fx.struct
     class SharedABStorage:
@@ -1120,12 +1128,15 @@ def gemm_a16w16_hti_gfx950_kernel(
                         ),
                     )
                     if const_expr(is_split_k):
+                        c_ptr = fx.get_iter(out)
                         global_offset = global_row * c_stride + global_col
                     else:
-                        # M * N can exceed 2^31.
-                        global_offset = fx.Int64(global_row) * c_stride + global_col
+                        c_ptr = c_tile
+                        global_offset = (
+                            m_part * half_block_m + local_row
+                        ) * c_stride + (n_part * half_block_n + local_col)
                     write_cshuffle_vec_to_global(
-                        out,
+                        c_ptr,
                         out_buf,
                         global_offset,
                         c_vec,
@@ -1398,6 +1409,9 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     in_bytes = result.in_data_bytes
     if max(m, n) * k * in_bytes >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
         return None
+    # C offsets within a tile are i32.
+    if result.block_m * n >= 1 << 31:
+        return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n
     if split_k > 1:
@@ -1467,6 +1481,13 @@ def get_split_k_buffers(stream, device, split_k):
             (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
         )
     return semaphore, signal
+
+
+def _span_bytes(tensor):
+    last = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return (last + 1) * tensor.element_size()
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
@@ -1614,6 +1635,13 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
+    # A and B are read through flat buffer descriptors with i32 offsets.
+    for name, operand in (("A", a), ("B", b)):
+        if operand.numel() and _span_bytes(operand) >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
+            raise ValueError(
+                f"{name} must span less than 4 GiB; got shape={tuple(operand.shape)} "
+                f"and stride={operand.stride()}"
+            )
     if not param.c_is_contiguous:
         if (
             out.stride(1) != 1
@@ -1623,6 +1651,11 @@ def gemm_a16w16(
             raise ValueError(
                 "out must be row-major with a leading stride of at least N and a "
                 f"multiple of {param.cshuffle_r2g_vec_size}; got stride={out.stride()}"
+            )
+        # C offsets within a tile are i32.
+        if out.stride(0) * param.block_m >= 1 << 31:
+            raise ValueError(
+                f"out row stride {out.stride(0)} is too large for block_m={param.block_m}"
             )
         # Split-K's buffer atomics address C with i32 offsets.
         span = ((m - 1) * out.stride(0) + n) * out.element_size()
