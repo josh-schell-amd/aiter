@@ -31,20 +31,20 @@ case "${1:-}" in
     pip install -q -r requirements.txt && pip install -q --upgrade pandas pyzmq einops numpy==1.26.2 "pybind11>=3.0.1" "ninja>=1.11.1" setuptools_scm tabulate pytest
     ./.github/scripts/install_triton.sh 2>&1 | tail -2
     AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -q -e . 2>&1 | tail -3
-    cd /app && python3 -c "import aiter, flydsl, os; print('aiter from', os.path.dirname(aiter.__file__)); print('flydsl', flydsl.__version__)"
+    cd /tmp && python3 -c "import aiter, flydsl, os; print('aiter from', os.path.dirname(aiter.__file__)); print('flydsl', flydsl.__version__)"
     ;;
   before)
     cd $SRC && git checkout -q $MAIN && echo "== AITER main $(git log --oneline -1 | cut -c1-70)"
     export HIP_VISIBLE_DEVICES=$(pick_gpu) FLYDSL_RUNTIME_ENABLE_CACHE=0
     [ "$HIP_VISIBLE_DEVICES" -ge 0 ] || { echo "no GPU with 40 GiB free"; exit 1; }
-    cd /app && rm -rf /tmp/aiter_configs && repro main
+    cd /tmp && rm -rf /tmp/aiter_configs && repro main
     cd $SRC && git checkout -q $PR
     ;;
   after)
     cd $SRC && git checkout -q $PR && echo "== AITER main + PR $(git log --oneline -1 | cut -c1-70)"
     export HIP_VISIBLE_DEVICES=$(pick_gpu) FLYDSL_RUNTIME_ENABLE_CACHE=0
     [ "$HIP_VISIBLE_DEVICES" -ge 0 ] || { echo "no GPU with 40 GiB free"; exit 1; }
-    cd /app && rm -rf /tmp/aiter_configs && repro pr
+    cd /tmp && rm -rf /tmp/aiter_configs && repro pr
     for args in "flydsl 340000" "flydsl 768000"; do python3 $V/mem.py $args 2>&1 | grep '^MEM'; done
     cd $SRC
     run flydsl_hgemm python3 op_tests/test_flydsl_hgemm.py
