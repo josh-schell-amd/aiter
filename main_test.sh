@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test the PR on AITER main (editable source install) inside jschell_aiter_main. Foreground.
+# Test the PR on AITER main (editable source install) inside jschell_aiter_main (rocm/pytorch, as AITER CI). Foreground.
 # Usage: bash main_test.sh install | before | after
 set -uo pipefail
 V=/projects/val; L=$V/logs/main; mkdir -p $L
@@ -27,7 +27,9 @@ case "${1:-}" in
     rm -rf $SRC
     git clone -q --recursive -b fix/flydsl-hgemm-int64-offsets https://github.com/josh-schell-amd/aiter.git $SRC || exit 1
     cd $SRC && git checkout -q $PR && git log --oneline -1
-    pip uninstall -y amd-aiter aiter >/dev/null 2>&1
+    # Same dependency setup as AITER's CI (aiter-test.yaml), then the README's editable install.
+    pip install -q -r requirements.txt && pip install -q --upgrade pandas pyzmq einops numpy==1.26.2 "pybind11>=3.0.1" "ninja>=1.11.1" setuptools_scm tabulate pytest
+    ./.github/scripts/install_triton.sh 2>&1 | tail -2
     AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -q -e . 2>&1 | tail -3
     cd /app && python3 -c "import aiter, flydsl, os; print('aiter from', os.path.dirname(aiter.__file__)); print('flydsl', flydsl.__version__)"
     ;;
