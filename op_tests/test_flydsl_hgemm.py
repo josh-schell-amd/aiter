@@ -270,49 +270,78 @@ def check_large_a():
     assert err == 0
 
 
-def check_strided_out():
-    # A row-strided `out` (a view into a larger buffer) is written in place.
+def _strided_out_rows():
     for row in _TUNED:
         m, n, k, policy, split_k, tile = _unpack(row)
-        if (m, n, k, policy, split_k) not in (
+        if (m, n, k, policy, split_k) in (
             (32, 14336, 4096, "ft", 1),
             (4096, 4096, 4096, "hti", 1),
             (16, 5120, 2880, "ft", 3),
         ):
-            continue
+            yield m, n, k, policy, split_k, tile
+
+
+def _run_tile(a, w, out, policy, tile):
+    return flydsl_hgemm(
+        a,
+        w,
+        out=out,
+        block_m=tile["block_m"],
+        block_n=tile["block_n"],
+        block_k=tile["block_k"],
+        stages=tile["stages"],
+        split_k=tile["split_k"],
+        m_waves=tile["m_waves"],
+        n_waves=tile["n_waves"],
+        k_waves=tile["k_waves"],
+        group_m=tile["group_m"],
+        policy=policy,
+    )
+
+
+def check_strided_out():
+    # A row-strided `out` (a view into a larger buffer) is written in place, at
+    # column offset 0 and at a nonzero offset (4-byte aligned for split-K's atomics).
+    for m, n, k, policy, split_k, tile in _strided_out_rows():
         torch.manual_seed(SEED)
         a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
         w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
-        parent = torch.full(
-            (m + tile["block_m"], n + tile["block_n"]), 4096.0, dtype=dtypes.bf16
-        )
-        out = parent[:m, :n]
-        y = flydsl_hgemm(
-            a,
-            w,
-            out=out,
-            block_m=tile["block_m"],
-            block_n=tile["block_n"],
-            block_k=tile["block_k"],
-            stages=tile["stages"],
-            split_k=tile["split_k"],
-            m_waves=tile["m_waves"],
-            n_waves=tile["n_waves"],
-            k_waves=tile["k_waves"],
-            group_m=tile["group_m"],
-            policy=policy,
-        )
-        assert y is out
-        assert torch.all(parent[m:] == 4096) and torch.all(parent[:, n:] == 4096)
+        ref = run_torch(a, w, dtypes.bf16).to(dtypes.fp32)
         atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
-        err = checkAllclose(
-            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
-            y.to(dtypes.fp32),
-            rtol=rtol,
-            atol=atol,
-            msg=f"strided out {m}x{n}x{k} {policy} ks{split_k}",
-        )
-        assert err == 0
+        for col in (0, 2 if split_k > 1 else 1):
+            parent = torch.full(
+                (m + tile["block_m"], n + tile["block_n"]), 4096.0, dtype=dtypes.bf16
+            )
+            out = parent[:m, col : col + n]
+            y = _run_tile(a, w, out, policy, tile)
+            assert y is out
+            outside = torch.ones_like(parent, dtype=torch.bool)
+            outside[:m, col : col + n] = False
+            assert torch.all(parent[outside] == 4096)
+            err = checkAllclose(
+                ref,
+                y.to(dtypes.fp32),
+                rtol=rtol,
+                atol=atol,
+                msg=f"strided out {m}x{n}x{k} {policy} ks{split_k} col {col}",
+            )
+            assert err == 0
+
+
+def check_split_k_out_alignment():
+    # Split-K's packed 16-bit atomics fault on an out that is not 4-byte aligned.
+    m, n, k, policy, _, tile = next(r for r in _strided_out_rows() if r[4] > 1)
+    a = torch.empty((m, k), dtype=dtypes.bf16)
+    w = torch.empty((n, k), dtype=dtypes.bf16)
+    strided = torch.empty((m, n + tile["block_n"]), dtype=dtypes.bf16)[:, 1 : 1 + n]
+    packed = torch.empty(m * n + 1, dtype=dtypes.bf16)[1:].view(m, n)
+    for out in (strided, packed):
+        try:
+            _run_tile(a, w, out, policy, tile)
+        except ValueError as e:
+            assert "4-byte-aligned" in str(e), e
+        else:
+            raise AssertionError(f"expected ValueError for out stride={out.stride()}")
 
 
 @benchmark()
@@ -414,6 +443,7 @@ def main():
         check_shape_limits()
         check_input_span()
         check_strided_out()
+        check_split_k_out_alignment()
         check_large_a()
 
     for dtype in args.dtype:
